@@ -41,7 +41,10 @@ def get_current_dir() -> Path:
 
 summarization_model = init_chat_model(model="openai:gpt-5")
 writer_model = init_chat_model(model="openai:gpt-5", max_tokens=32000)
-tavily_client = TavilyClient()
+try:
+    tavily_client = TavilyClient()
+except Exception:
+    tavily_client = None
 MAX_CONTEXT_LENGTH = 250000
 
 # ===== SEARCH FUNCTIONS =====
@@ -65,6 +68,9 @@ def tavily_search_multiple(
     """
 
     # Execute searches sequentially. Note: yon can use AsyncTavilyClient to parallelize this step.
+    if tavily_client is None:
+        return []
+
     search_docs = []
     for query in search_queries:
         result = tavily_client.search(
