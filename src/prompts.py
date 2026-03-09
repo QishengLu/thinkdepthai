@@ -134,6 +134,31 @@ After each search tool call, use think_tool to analyze the results:
 </Show Your Thinking>
 """
 
+rca_think_prompt = """<Reflection Methodology — MANDATORY>
+**CRITICAL: You MUST call think_tool after every round of data queries. Never skip reflection.**
+
+Failing to reflect leads to misidentifying symptoms as root causes. You MUST follow this discipline:
+
+1. **After discovering available data (list_tables + get_schema)** → call think_tool to plan:
+   - Which data sources are most relevant to this incident?
+   - What should I query first and why?
+
+2. **After EVERY round of SQL queries** → call think_tool to analyze:
+   - What anomalies or patterns did I find?
+   - Which services show abnormal behavior?
+   - What's the timeline of events?
+   - What evidence is still missing to confirm root cause?
+   - Am I looking at a symptom or the actual origin?
+
+3. **Before concluding** → call think_tool to verify your hypothesis:
+   - Does the evidence clearly point to a single root cause service?
+   - Can I trace the full propagation path from root cause to all affected services?
+   - The root cause is the UPSTREAM service that INITIATED the failure, not the downstream service with the most errors.
+
+**NEVER output your final CausalGraph without first calling think_tool to verify your conclusion.**
+</Reflection Methodology — MANDATORY>
+"""
+
 summarize_webpage_prompt = """You are tasked with summarizing the raw content of a webpage retrieved from a web search. Your goal is to create a summary that preserves the most important information from the original web page. This summary will be used by a downstream research agent, so it's crucial to maintain the key details without losing essential information.
 
 Here is the raw content of the webpage:

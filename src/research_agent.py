@@ -23,11 +23,13 @@ tools = [tavily_search, think_tool, list_tables_in_directory, get_schema, query_
 tools_by_name = {tool.name: tool for tool in tools}
 
 # Initialize models
-model = init_chat_model(model="openai:gpt-5")
+# model = init_chat_model(model="openai:gpt-5")
+model = init_chat_model(model="openai:kimi-k2-0905-preview")
 model_with_tools = model.bind_tools(tools)
-summarization_model = init_chat_model(model="openai:gpt-5")
-compress_model = init_chat_model(model="openai:gpt-5", max_tokens=32000) # model="anthropic:claude-sonnet-4-20250514", max_tokens=64000
-
+# summarization_model = init_chat_model(model="openai:gpt-5")
+summarization_model = init_chat_model(model="openai:kimi-k2-0905-preview")
+# compress_model = init_chat_model(model="openai:gpt-5", max_tokens=32000) # model="anthropic:claude-sonnet-4-20250514", max_tokens=64000
+compress_model = init_chat_model(model="openai:kimi-k2-0905-preview", max_tokens=32000)
 # ===== AGENT NODES =====
 
 def llm_call(state: ResearcherState):

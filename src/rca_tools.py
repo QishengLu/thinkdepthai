@@ -67,6 +67,45 @@ def _enforce_token_limit(payload: str, context: str) -> str:
     }
     return json.dumps(warning, ensure_ascii=False, indent=2)
 
+ALLOWED_STEMS = {
+    "normal_logs", "abnormal_logs",
+    "normal_traces", "abnormal_traces",
+    "normal_metrics", "abnormal_metrics",
+    "normal_metrics_histogram", "abnormal_metrics_histogram",
+    "normal_metrics_sum", "abnormal_metrics_sum",
+}
+
+def _sanitize_column_name(name: str) -> str:
+    """Replace dots in column names with underscores to avoid DuckDB dot-notation ambiguity."""
+    return name.replace(".", "_")
+
+
+def _build_rename_select(parquet_path: str) -> str:
+    """Build a SELECT clause that renames dot-containing columns for a parquet file.
+
+    Returns 'SELECT col1, "attr.x" AS attr_x, ...' or 'SELECT *' if no renames needed.
+    """
+    duckdb = _import_duckdb()
+    conn = duckdb.connect(":memory:")
+    try:
+        result = conn.execute(f"SELECT * FROM read_parquet('{parquet_path}') LIMIT 0")
+        columns = [desc[0] for desc in result.description]
+    finally:
+        conn.close()
+
+    needs_rename = any("." in col for col in columns)
+    if not needs_rename:
+        return "*"
+
+    parts = []
+    for col in columns:
+        if "." in col:
+            parts.append(f'"{col}" AS {_sanitize_column_name(col)}')
+        else:
+            parts.append(col)
+    return ", ".join(parts)
+
+
 def _validate_parquet_files(parquet_files: Union[str, List[str]]) -> List[str]:
     """Validate parquet files exist and return as list."""
     if isinstance(parquet_files, str):
@@ -85,15 +124,15 @@ def _validate_parquet_files(parquet_files: Union[str, List[str]]) -> List[str]:
 def list_tables_in_directory(directory: str) -> str:
     """
     List all parquet files in a directory with metadata.
-    
+
     Args:
         directory: Directory path to search for parquet files
-        
+
     Returns:
         JSON string containing list of files with metadata
     """
     duckdb = _import_duckdb()
-    
+
     dir_path = Path(directory)
     if not dir_path.exists():
         return json.dumps({"error": f"Directory not found: {directory}"})
@@ -103,9 +142,11 @@ def list_tables_in_directory(directory: str) -> str:
 
     files_info = []
     cwd = Path.cwd()
-    
-    # Use rglob to find parquet files recursively
-    for file_path in dir_path.rglob("*.parquet"):
+
+    # Use rglob to find parquet files recursively (only allowed stems)
+    for file_path in sorted(dir_path.rglob("*.parquet")):
+        if Path(file_path).stem not in ALLOWED_STEMS:
+            continue
         file_path_str = str(file_path)
         file_path_obj = Path(file_path_str)
         if file_path_obj.is_absolute():
@@ -144,21 +185,12 @@ def list_tables_in_directory(directory: str) -> str:
     result_json = json.dumps(files_info, ensure_ascii=False, indent=2)
     return _enforce_token_limit(result_json, "list_tables_in_directory")
 
-@tool
-def get_schema(parquet_file: str) -> str:
-    """
-    Get schema information of a parquet file.
-    
-    Args:
-        parquet_file: Path to parquet file to inspect
-        
-    Returns:
-        JSON string containing file metadata
-    """
+def _get_schema_one(parquet_file: str) -> dict:
+    """Get schema for a single parquet file, returning a dict."""
     duckdb = _import_duckdb()
-    
+
     if not Path(parquet_file).exists():
-        return json.dumps({"error": f"Parquet file not found: {parquet_file}"})
+        return {"error": f"Parquet file not found: {parquet_file}"}
 
     conn = duckdb.connect(":memory:")
     try:
@@ -173,7 +205,7 @@ def get_schema(parquet_file: str) -> str:
             parquet_file_rel = parquet_file
 
         result = conn.execute(f"SELECT * FROM read_parquet('{parquet_file}') LIMIT 0")
-        schema = [{"name": desc[0], "type": str(desc[1])} for desc in result.description]
+        schema = [{"name": _sanitize_column_name(desc[0]), "type": str(desc[1])} for desc in result.description]
 
         row_count_result = conn.execute(f"SELECT COUNT(*) FROM read_parquet('{parquet_file}')").fetchone()
         if row_count_result is None:
@@ -181,19 +213,35 @@ def get_schema(parquet_file: str) -> str:
         else:
             row_count = row_count_result[0]
 
-        schema_info = {
+        return {
             "file": parquet_file,
             "row_count": row_count,
             "columns": schema,
         }
 
-        result_json = json.dumps(schema_info, ensure_ascii=False, indent=2)
-        return _enforce_token_limit(result_json, "get_schema")
-
     except Exception as e:
-        return json.dumps({"error": f"Failed to extract schema: {str(e)}"})
+        return {"error": f"Failed to extract schema: {str(e)}"}
     finally:
         conn.close()
+
+
+@tool
+def get_schema(parquet_files: Union[str, List[str]]) -> str:
+    """
+    Get schema information of a parquet file, or a list of parquet files.
+
+    Args:
+        parquet_files: Path to a parquet file, or list of paths for batch lookup
+
+    Returns:
+        JSON string containing file metadata — single object if one file, list if multiple
+    """
+    if isinstance(parquet_files, str):
+        result_json = json.dumps(_get_schema_one(parquet_files), ensure_ascii=False, indent=2)
+    else:
+        result_json = json.dumps([_get_schema_one(f) for f in parquet_files], ensure_ascii=False, indent=2)
+
+    return _enforce_token_limit(result_json, "get_schema")
 
 @tool
 def query_parquet_files(parquet_files: Union[str, List[str]], query: str, limit: int = 10) -> str:
@@ -241,7 +289,8 @@ def query_parquet_files(parquet_files: Union[str, List[str]], query: str, limit:
                 table_name = f"{base_name}_{counter}"
                 counter += 1
             table_names.add(table_name)
-            conn.execute(f"CREATE VIEW {table_name} AS SELECT * FROM read_parquet('{file_path}')")
+            select_clause = _build_rename_select(file_path)
+            conn.execute(f"CREATE VIEW {table_name} AS SELECT {select_clause} FROM read_parquet('{file_path}')")
 
         # Execute query
         result = conn.execute(query).fetchall()
