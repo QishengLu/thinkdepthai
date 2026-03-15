@@ -7,14 +7,29 @@ stdin:  JSON { question, system_prompt, user_prompt,
 stdout: JSON { output (CausalGraph JSON), trajectory (OpenAI 格式) }
 """
 import json
+import os
 import sys
 from pathlib import Path
+
+sys.path.insert(0, "/home/nn/SOTA-agents/RolloutRunner")
+from src.usage_tracker import UsageTracker
+
+_tracker = UsageTracker()
+_tracker.install_openai_hooks()
+_tracker.install_anthropic_hooks()  # ChatAnthropic 走 Anthropic SDK，需要单独 hook
+
+# 清理 RolloutRunner 路径和 src 模块缓存，避免与本项目的 src 包冲突
+sys.path.remove("/home/nn/SOTA-agents/RolloutRunner")
+for _mod in list(sys.modules):
+    if _mod == "src" or _mod.startswith("src."):
+        del sys.modules[_mod]
+
 
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-from langchain.chat_models import init_chat_model
+from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -28,7 +43,7 @@ from typing_extensions import Literal
 from deep_research.prompts import rca_think_prompt
 from deep_research.state_research import ResearcherOutputState, ResearcherState
 from deep_research.utils import think_tool
-from src.rca_tools import get_schema, list_tables_in_directory, query_parquet_files
+from deep_research.rca_tools import get_schema, list_tables_in_directory, query_parquet_files
 
 # ── 工具集（去掉 tavily_search，与 RCA_ANALYSIS_SP 描述一致）─────────────────
 RCA_TOOLS = [think_tool, list_tables_in_directory, get_schema, query_parquet_files]
@@ -37,9 +52,23 @@ RCA_TOOLS_BY_NAME = {t.name: t for t in RCA_TOOLS}
 
 # ── 节点工厂（闭包注入 prompt/tools，保持原拓扑）─────────────────────────────
 
+def _make_anthropic_model(max_tokens: int = 32768) -> ChatAnthropic:
+    """Create ChatAnthropic pointing to shubiaobiao API (Anthropic-compatible endpoint)."""
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.shubiaobiao.cn/v1")
+    # Anthropic SDK expects base_url without /v1 suffix
+    base_url = base_url.rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+    return ChatAnthropic(
+        model="claude-sonnet-4-6",
+        api_key=os.environ["OPENAI_API_KEY"],
+        base_url=base_url,
+        max_tokens=max_tokens,
+    )
+
+
 def make_llm_call(combined_system_prompt: str):
-    # model = init_chat_model(model="openai:doubao-seed-2-0-pro-260215")
-    model = init_chat_model(model="openai:kimi-k2-0905-preview")
+    model = _make_anthropic_model()
     model_with_tools = model.bind_tools(RCA_TOOLS)
 
     def llm_call(state: ResearcherState):
@@ -61,7 +90,7 @@ def tool_node(state: ResearcherState):
     for tc in tool_calls:
         tool = RCA_TOOLS_BY_NAME[tc["name"]]
         result = tool.invoke(tc["args"])
-        outputs.append(ToolMessage(content=result, name=tc["name"], tool_call_id=tc["id"]))
+        outputs.append(ToolMessage(content=str(result), name=tc["name"], tool_call_id=tc["id"]))
     return {"researcher_messages": outputs}
 
 
@@ -70,8 +99,7 @@ def should_continue(state: ResearcherState) -> Literal["tool_node", "compress_re
 
 
 def make_compress_research(compress_sp: str, compress_up: str):
-    # compress_model = init_chat_model(model="openai:doubao-seed-2-0-pro-260215", max_tokens=32000)
-    compress_model = init_chat_model(model="openai:kimi-k2-0905-preview", max_tokens=32000)
+    compress_model = _make_anthropic_model(max_tokens=32000)
 
     def compress_research(state: ResearcherState) -> dict:
         messages = (
@@ -140,7 +168,14 @@ def to_openai_message(msg) -> dict | None:
             }
             for tc in (msg.tool_calls or [])
         ]
-        entry: dict = {"role": "assistant", "content": str(msg.content) if msg.content else ""}
+        # Anthropic SDK returns content as list of blocks; extract text parts
+        content = msg.content
+        if isinstance(content, list):
+            content = " ".join(
+                b.get("text", "") if isinstance(b, dict) and b.get("type") == "text" else ""
+                for b in content
+            ).strip()
+        entry: dict = {"role": "assistant", "content": str(content) if content else ""}
         if tool_calls:
             entry["tool_calls"] = tool_calls
         return entry
@@ -192,6 +227,7 @@ def main():
     result = {
         "output": strip_markdown_json(compressed_research),
         "trajectory": convert_trajectory(all_messages),
+        "usage": _tracker.get_usage(),
     }
     # 单行输出，runner._parse_last_json 从末行解析
     print(json.dumps(result, ensure_ascii=False))
