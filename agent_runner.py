@@ -16,7 +16,11 @@ from src.usage_tracker import UsageTracker
 
 _tracker = UsageTracker()
 _tracker.install_openai_hooks()
-_tracker.install_anthropic_hooks()  # ChatAnthropic 走 Anthropic SDK，需要单独 hook
+
+# 根据模型选择 hook：Claude 走 Anthropic SDK，其余走 OpenAI SDK
+_RCA_MODEL = os.environ.get("RCA_MODEL", "claude-sonnet-4-6")
+if _RCA_MODEL.startswith("claude"):
+    _tracker.install_anthropic_hooks()
 
 # 清理 RolloutRunner 路径和 src 模块缓存，避免与本项目的 src 包冲突
 sys.path.remove("/home/nn/SOTA-agents/RolloutRunner")
@@ -29,7 +33,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-from langchain_anthropic import ChatAnthropic
+from model_factory import create_model
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -52,23 +56,16 @@ RCA_TOOLS_BY_NAME = {t.name: t for t in RCA_TOOLS}
 
 # ── 节点工厂（闭包注入 prompt/tools，保持原拓扑）─────────────────────────────
 
-def _make_anthropic_model(max_tokens: int = 32768) -> ChatAnthropic:
-    """Create ChatAnthropic pointing to shubiaobiao API (Anthropic-compatible endpoint)."""
-    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.shubiaobiao.cn/v1")
-    # Anthropic SDK expects base_url without /v1 suffix
-    base_url = base_url.rstrip("/")
-    if base_url.endswith("/v1"):
-        base_url = base_url[:-3]
-    return ChatAnthropic(
-        model="claude-sonnet-4-6",
-        api_key=os.environ["OPENAI_API_KEY"],
-        base_url=base_url,
-        max_tokens=max_tokens,
-    )
+RCA_MODEL = os.environ.get("RCA_MODEL", "claude-sonnet-4-6")
+
+
+def _make_model(max_tokens: int = 32768):
+    """Create LLM via model_factory. Model name from RCA_MODEL env var."""
+    return create_model(RCA_MODEL, max_tokens=max_tokens)
 
 
 def make_llm_call(combined_system_prompt: str):
-    model = _make_anthropic_model()
+    model = _make_model()
     model_with_tools = model.bind_tools(RCA_TOOLS)
 
     def llm_call(state: ResearcherState):
@@ -99,7 +96,7 @@ def should_continue(state: ResearcherState) -> Literal["tool_node", "compress_re
 
 
 def make_compress_research(compress_sp: str, compress_up: str):
-    compress_model = _make_anthropic_model(max_tokens=32000)
+    compress_model = _make_model(max_tokens=32000)
 
     def compress_research(state: ResearcherState) -> dict:
         messages = (
@@ -215,7 +212,7 @@ def main():
     all_messages: list = []
     compressed_research = ""
 
-    for event in agent.stream(initial_state, config={"recursion_limit": 100}):
+    for event in agent.stream(initial_state, config={"recursion_limit": 200}):
         for key, value in event.items():
             if not isinstance(value, dict):
                 continue
@@ -224,10 +221,30 @@ def main():
             if "compressed_research" in value:
                 compressed_research = value["compressed_research"]
 
+    # Usage 采集：Claude 走 UsageTracker（Anthropic SDK hook），其余从 LangChain response metadata 采集
+    if RCA_MODEL.startswith("claude"):
+        usage = _tracker.get_usage()
+    else:
+        # 非 Claude 模型：从 AIMessage.usage_metadata 累加（LangChain 自动解析 OpenAI SDK response）
+        _total_in, _total_out, _llm_calls = 0, 0, 0
+        for msg in all_messages:
+            if isinstance(msg, AIMessage) and hasattr(msg, "usage_metadata") and msg.usage_metadata:
+                um = msg.usage_metadata
+                _total_in += um.get("input_tokens", 0)
+                _total_out += um.get("output_tokens", 0)
+                _llm_calls += 1
+        usage = {
+            "total_tokens": _total_in + _total_out,
+            "prompt_tokens": _total_in,
+            "completion_tokens": _total_out,
+            "reasoning_tokens": 0,
+            "llm_call_count": _llm_calls,
+        }
+
     result = {
         "output": strip_markdown_json(compressed_research),
         "trajectory": convert_trajectory(all_messages),
-        "usage": _tracker.get_usage(),
+        "usage": usage,
     }
     # 单行输出，runner._parse_last_json 从末行解析
     print(json.dumps(result, ensure_ascii=False))
