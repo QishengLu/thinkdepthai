@@ -212,7 +212,7 @@ def main():
     all_messages: list = []
     compressed_research = ""
 
-    for event in agent.stream(initial_state, config={"recursion_limit": 200}):
+    for event in agent.stream(initial_state, config={"recursion_limit": 300}):
         for key, value in event.items():
             if not isinstance(value, dict):
                 continue
