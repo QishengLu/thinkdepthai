@@ -6,7 +6,9 @@ stdin:  JSON { question, system_prompt, user_prompt,
                compress_system_prompt, compress_user_prompt, data_dir }
 stdout: JSON { output (CausalGraph JSON), trajectory (OpenAI 格式) }
 """
+import argparse
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -48,6 +50,7 @@ from deep_research.prompts import rca_think_prompt
 from deep_research.state_research import ResearcherOutputState, ResearcherState
 from deep_research.utils import think_tool
 from deep_research.rca_tools import get_schema, list_tables_in_directory, query_parquet_files
+from middleware import MiddlewareConfig, MiddlewarePipeline
 
 # ── 工具集（去掉 tavily_search，与 RCA_ANALYSIS_SP 描述一致）─────────────────
 RCA_TOOLS = [think_tool, list_tables_in_directory, get_schema, query_parquet_files]
@@ -136,6 +139,62 @@ def build_agent(combined_sp: str, compress_sp: str, compress_up: str):
     return builder.compile()
 
 
+def build_agent_with_middleware(
+    combined_sp: str, compress_sp: str, compress_up: str,
+    pipeline: MiddlewarePipeline,
+):
+    """Same graph topology as build_agent, but with middleware hooks."""
+
+    def tool_node_mw(state: ResearcherState):
+        messages = state["researcher_messages"]
+        tool_calls = messages[-1].tool_calls
+        outputs = []
+        for tc in tool_calls:
+            tool = RCA_TOOLS_BY_NAME[tc["name"]]
+            result = tool.invoke(tc["args"])
+            outputs.append(ToolMessage(content=str(result), name=tc["name"], tool_call_id=tc["id"]))
+
+        round_num = sum(1 for m in messages if hasattr(m, "tool_calls") and m.tool_calls)
+
+        # Extract assistant content for reasoning log
+        assistant_content = ""
+        for m in reversed(messages):
+            if hasattr(m, "content") and hasattr(m, "tool_calls"):
+                assistant_content = m.content or ""
+                break
+
+        intervention = pipeline.process_tool_calls(
+            tool_calls, round_num, assistant_content
+        )
+        if intervention:
+            outputs.append(HumanMessage(content=intervention))
+
+        return {"researcher_messages": outputs}
+
+    def should_continue_mw(state: ResearcherState) -> Literal["tool_node", "compress_research", "llm_call"]:
+        if state["researcher_messages"][-1].tool_calls:
+            return "tool_node"
+        intervention = pipeline.check_before_conclusion()
+        if intervention:
+            state["researcher_messages"].append(HumanMessage(content=intervention))
+            return "llm_call"
+        return "compress_research"
+
+    builder = StateGraph(ResearcherState, output_schema=ResearcherOutputState)
+    builder.add_node("llm_call", make_llm_call(combined_sp))
+    builder.add_node("tool_node", tool_node_mw)
+    builder.add_node("compress_research", make_compress_research(compress_sp, compress_up))
+    builder.add_edge(START, "llm_call")
+    builder.add_conditional_edges(
+        "llm_call",
+        should_continue_mw,
+        {"tool_node": "tool_node", "compress_research": "compress_research", "llm_call": "llm_call"},
+    )
+    builder.add_edge("tool_node", "llm_call")
+    builder.add_edge("compress_research", END)
+    return builder.compile()
+
+
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
 
 def strip_markdown_json(text: str) -> str:
@@ -190,6 +249,30 @@ def convert_trajectory(messages: list) -> list[dict]:
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable real-time step logging to stderr")
+    parser.add_argument("--log-file", default=None,
+                        help="Write verbose logs to file (implies --verbose)")
+    args, _ = parser.parse_known_args()
+
+    logger = logging.getLogger("agent_runner")
+    if args.log_file or args.verbose:
+        handlers = []
+        fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S")
+        if args.verbose:
+            h = logging.StreamHandler(sys.stderr)
+            h.setFormatter(fmt)
+            handlers.append(h)
+        if args.log_file:
+            os.makedirs(os.path.dirname(args.log_file) or ".", exist_ok=True)
+            h = logging.FileHandler(args.log_file, mode="w")
+            h.setFormatter(fmt)
+            handlers.append(h)
+        logging.basicConfig(level=logging.INFO, handlers=handlers)
+    else:
+        logging.basicConfig(level=logging.WARNING)
+
     payload = json.loads(sys.stdin.read())
 
     system_prompt = payload["system_prompt"]
@@ -205,21 +288,43 @@ def main():
     # RCA 领域指令在前（主体），反思方法论在后（补充）
     combined_sp = system_prompt + "\n\n---\n\n" + rca_think_prompt
 
-    agent = build_agent(combined_sp, compress_sp, compress_up)
+    mw_config = MiddlewareConfig()
+    if mw_config.enabled:
+        mw_model = _make_model(max_tokens=512)
+        pipeline = MiddlewarePipeline(mw_model, mw_config)
+        agent = build_agent_with_middleware(combined_sp, compress_sp, compress_up, pipeline)
+    else:
+        agent = build_agent(combined_sp, compress_sp, compress_up)
 
     initial_state = {"researcher_messages": [HumanMessage(content=user_prompt)]}
 
     all_messages: list = []
     compressed_research = ""
+    step_num = 0
 
     for event in agent.stream(initial_state, config={"recursion_limit": 300}):
         for key, value in event.items():
             if not isinstance(value, dict):
                 continue
             if "researcher_messages" in value:
-                all_messages.extend(value["researcher_messages"])
+                new_msgs = value["researcher_messages"]
+                all_messages.extend(new_msgs)
+                step_num += 1
+                for m in new_msgs:
+                    if isinstance(m, AIMessage):
+                        tc_names = [tc["name"] for tc in (m.tool_calls or [])]
+                        content_preview = str(m.content)[:120] if m.content else ""
+                        if tc_names:
+                            logger.info(f"[step {step_num}] {key}: AI → tool_calls={tc_names}")
+                        else:
+                            logger.info(f"[step {step_num}] {key}: AI (no tools) → {content_preview}...")
+                    elif isinstance(m, ToolMessage):
+                        logger.info(f"[step {step_num}] {key}: Tool({m.name}) → {str(m.content)[:100]}...")
+                    elif isinstance(m, HumanMessage):
+                        logger.info(f"[step {step_num}] {key}: MW intervention → {str(m.content)[:120]}...")
             if "compressed_research" in value:
                 compressed_research = value["compressed_research"]
+                logger.info(f"[step {step_num}] compress_research done, len={len(compressed_research)}")
 
     # Usage 采集：Claude 走 UsageTracker（Anthropic SDK hook），其余从 LangChain response metadata 采集
     if RCA_MODEL.startswith("claude"):
