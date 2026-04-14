@@ -20,3 +20,6 @@ venv/
 
 # Logs
 *.log
+
+# Local analysis/plan docs
+middleware/v4_plan.md
