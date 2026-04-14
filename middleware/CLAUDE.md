@@ -197,6 +197,196 @@ L3 生成干预文本时的硬规则：
 
 ---
 
+## v3 实跑结果（thinkdepthai-qwen3.5-plus-mw-v3, 105 case, 2026-04-14 分析）
+
+**整体翻正率 49/105 = 46.7%**，零回归。完整 case 对比报告：[`analysis/4-middleware/MW-vs-w_o-MW.md`](../../analysis/4-middleware/MW-vs-w_o-MW.md)。
+
+### 干预触发覆盖
+
+| 干预类型 | 触发 case 数 | 触发率 |
+|---|---|---|
+| Process advisor (B1/B2/B3/B5/M1/M2) | 61 / 105 | 58% |
+| Conclusion check (固定 9 项) | **105 / 105** | 100% |
+
+### 干预触发分布与设计预期的偏差
+
+| 设计预期 | 实测 | 偏差原因 |
+|---|---|---|
+| query 37/44 双中期检查触发 ~80% case | 仅 58% (61/105) | **44/105 (42%) case 在 qpf < 37 提前收敛**，process 检查永远没机会触发 |
+| Conclusion check 兜底 ~26 个过早收敛 case | 实际 105/105 都触发 | 兜底机制工作，但效果几乎不可观测——见下方 Bug 1 |
+
+### wrong→correct 的 49 个 case 的承重干预归因
+
+| 救回方式 | 数量 | 备注 |
+|---|---|---|
+| Process + Conclusion 双触发 | 28 | process 干预承重 (B3 最有效) |
+| 仅 Conclusion 触发 (process silent) | 21 | qpf<37 提前收敛 |
+| ↳ conclusion=back_to_tools | 9 | agent 真听话又查了 1-3 轮 tool |
+| ↳ conclusion=rewrite | 12 | agent 没听话只重写——疑似 L1 分类器扰动采样 |
+
+### Process advisor 中各维度的实际承重次数
+
+| 维度 | 触发次数 (process 阶段) | wrong→correct 承重 | wrong→wrong 触发但失效 |
+|---|---|---|---|
+| B3 缺基线 | 14 | **14 (highest impact)** | 0 |
+| B1 调查停滞 | 14 | 14 | 多次 misdirected |
+| B5 上游盲区 | 6 | 6 | 0 |
+| M1 缺因果方向 | 6 | 6 | 多次 misdirected |
+| M2 共享组件锚定 | 6 | 6 | 0 |
+| B2 模态不全 | 2 | 2 | 0 |
+
+---
+
+## ⚠️ v3 已知 Bug（必须 v4 修复）
+
+### Bug 1 — `should_continue_mw` 在 conditional edge 里 mutate state
+
+**位置**：[`agent_runner.py:174-181`](../agent_runner.py#L174-L181)
+
+```python
+def should_continue_mw(state: ResearcherState) -> Literal[...]:
+    if state["researcher_messages"][-1].tool_calls:
+        return "tool_node"
+    intervention = pipeline.check_before_conclusion()
+    if intervention:
+        state["researcher_messages"].append(HumanMessage(content=intervention))  # ← BUG
+        return "llm_call"
+    return "compress_research"
+```
+
+**问题**：LangGraph conditional edge 函数的契约是**只能返回路由字符串、不能 mutate state**。这里 `state["researcher_messages"].append(...)` 是在原地改 dict，**不会经过 `add_messages` reducer**，结果是：
+
+1. 注入的 HumanMessage **能被下一个 llm_call 节点读到**（state 是同一个内存对象）→ agent 确实会响应它
+2. 但 LangGraph 的 stream event **不会 emit 这条 HumanMessage**（它不是节点 return value）
+3. 因此 trajectory 序列化时**永远看不到这条 conclusion 干预内容**
+4. 同样的 reducer 也保证了 v3 重启不会读到 conclusion 干预——只在内存 lifecycle 内有效
+
+**实证**：
+- DB 全文搜 `Pre-Conclusion` 在 105 个 MW case 里命中 **0 次**
+- baseline 50 sample 中**没有任何**连续 assistant 形态
+- MW 105 case 中**全部 105/105**有 `(assistant 无 tool_calls) → (assistant)` 的连续形态——这是 conclusion check 触发后 agent 收到不可见 HumanMessage 的间接指纹
+
+**影响**：
+- 每个 case 的 conclusion 干预内容在 trajectory 里完全不可审计
+- 只能通过"下一条 assistant 是否带 tool_calls"间接判断 agent 是否听话（22 个 back_to_tools / 83 个 rewrite）
+- 用户希望分析 "中间件具体提了什么" 时，无法回答
+
+**修复方案**：把 conclusion 检查从 conditional edge 重构成一个真正的图节点 `pre_conclusion_check`：
+
+```python
+# 新增节点 - return value 走正常 reducer
+def pre_conclusion_check_node(state: ResearcherState):
+    intervention = pipeline.check_before_conclusion()
+    if intervention:
+        return {"researcher_messages": [HumanMessage(content=intervention)]}
+    return {}
+
+# 把 should_continue_mw 拆成两个：
+# (1) llm_call 后判断有没有 tool_calls
+# (2) 如果没有，进入 pre_conclusion_check_node，节点判断要不要 conclude
+def should_continue_mw(state):
+    if state["researcher_messages"][-1].tool_calls:
+        return "tool_node"
+    return "pre_conclusion_check"
+
+def after_pre_conclusion(state):
+    # 新增的节点跑完后判断要不要回 llm_call
+    last = state["researcher_messages"][-1]
+    if isinstance(last, HumanMessage) and "Investigation Advisor" in last.content:
+        return "llm_call"
+    return "compress_research"
+
+builder.add_node("pre_conclusion_check", pre_conclusion_check_node)
+builder.add_conditional_edges("llm_call", should_continue_mw, {...})
+builder.add_conditional_edges("pre_conclusion_check", after_pre_conclusion, {...})
+```
+
+修完后 trajectory 会自然包含 conclusion 干预的完整文本，所有间接的 loopback 启发式都可以删除。
+
+### Bug 2 — `_run_conclusion_cycle` 是死代码
+
+**位置**：[`pipeline.py:193-212`](pipeline.py#L193-L212)
+
+`check_before_conclusion()` 直接返回硬编码的 `_CONCLUSION_PROMPT`（[pipeline.py:108-141](pipeline.py#L108-L141)），**根本不调用** `_run_conclusion_cycle()` / `ConclusionDetector` / L3 generator。
+
+后果：
+- v3 的 conclusion 检查**没有动态检测**，每次都注入完全相同的 9 条目固定文本
+- `ConclusionDetector` 类里的 M1/M2/M3/M4 维度从来不会被 LLM 评估
+- L3 `InterventionGenerator` 在 conclusion 阶段从来不被调用
+
+**修复方案**：要么把 `_run_conclusion_cycle()` 真正接进 `check_before_conclusion()`，要么删掉 `ConclusionDetector` 和 `_run_conclusion_cycle()` 让代码意图清晰。
+
+### Bug 3 — v3 检查点 [37, 44] 对 42% 的 case 太晚
+
+**实测**：105 case 中有 **44 个 (42%) qpf < 37**，process 检查永远没机会触发。这正是 [middleware/CLAUDE.md 上文](#过早收敛)预期由 conclusion check 兜底的"过早收敛"群体——但因为 Bug 1，conclusion 干预不可观测，无法验证它实际有没有用。
+
+**已有数据反推**：
+- 21 个 wrong→correct 的"silent process" case 中，9 个 conclusion=back_to_tools（agent 真去查了证据），12 个 rewrite（agent 没动作）
+- back_to_tools 那 9 个**强烈暗示 conclusion check 起到了挽救作用**——但需要修 Bug 1 才能直接观测
+
+**修复选项**（三选一或组合）：
+
+| 方案 | 描述 | 代价 |
+|---|---|---|
+| (a) 提前增加 query 20 检查点 | `check_points = [20, 37, 44]`，但 query 20 时正确 case 还有 ~95% 在跑，误伤率会很高 | 低实现成本，高 LLM 调用成本 |
+| (b) 检查点改成相对终点而非绝对 query 数 | 监控 agent 的 think_tool reflection，发现 "I have sufficient evidence" 类语句时立即触发 | 中等实现成本，需要做关键词匹配 |
+| (c) 修 Bug 1 让 conclusion check 内容可见 + 把 conclusion check 升级成动态 | 让 conclusion check 真的跑 `_run_conclusion_cycle()` 而不是固定文本 | 中等成本，从根本上解决"过早收敛"分支 |
+
+**推荐 (a)+(c) 组合**：先修 Bug 1 让 conclusion 可观测，再加 query 20 检查点弥补长尾。
+
+---
+
+## v3 已知失败模式（来自 105 case 分析）
+
+详细 case 见[`MW-vs-w_o-MW.md`](../../analysis/4-middleware/MW-vs-w_o-MW.md) 的 batch 分析。这里只列总结。
+
+### 干预条目无法对抗的反模式
+
+#### M3-recurring："消失即根因" (Empty-Service Hypothesis)
+- 表现：agent 把 "missing from abnormal_traces" / "metric is NaN" 当作根因证据
+- 出现在：case 341, 1934 等
+- 当前 MW 缺口：B/M 检测维度里没有专门项；M3 (Absence ≠ Health) 只在 conclusion detector 出现，且 conclusion detector 是死代码 (Bug 2)
+- 建议新维度 **B6: Empty-Service Hypothesis**：当 agent 把 "X is missing/NaN/empty" 作为根因证据时给出反向提醒
+
+#### R5 太强 / R6 锚定回退
+- 表现：MW 干预正确指出方向，agent 形式上响应（多查几条），但思考方向不变
+- 出现在：case 579, 4375 等
+- 当前 MW 缺口：现有 prompt 偏"提醒思考"，没有"强制重新评估早期假设"的强干预
+- 建议：在多次 B1 触发同一服务后升级为强提示——明确要求 agent 列出"如果 X 被排除会怎样"
+
+#### B3 引发 baseline 重复 → B1 又开火（自循环）
+- 表现：B3 让 agent 大量做 baseline_collect，B1 检测到这些为"重复"再次开火
+- 出现在：case 1495
+- 修复：让 B1 的检测器排除"baseline 类意图"，或者在 B3 触发后给 baseline 重复 5 次的宽限期
+
+### Conclusion rewrite 翻正之谜（12 个 case）
+
+12 个 wrong→correct 的 case 没有任何 process advisor，conclusion check 是 `rewrite` 模式（agent 没多查任何 tool），但答案就是从错变对了。可能解释：
+
+1. **L1 分类器的 background LLM 调用扰动 qwen3.5 的 token 采样**（最可能）
+2. conclusion prompt 中的 R6 锚定 / R7 幸存者偏差提示让 agent 重新看了同一份证据
+3. 随机性
+
+**统计意义上不应算作 MW 真实增益**——D 段建议把这 12 个 case 从"MW 救回率"里剔除，得到更保守的 49-12 = 37/105 = 35% 真实救回率。
+
+---
+
+## v4 改进路线图
+
+按优先级排序（修 bug 优先于加功能）：
+
+| 优先级 | 项目 | 类型 | 预期收益 |
+|---|---|---|---|
+| **P0** | 修 Bug 1（conclusion check 改成节点） | bugfix | 让 conclusion 干预可审计，所有间接启发式可删 |
+| **P0** | 决定 Bug 2 处理（接通或删除 `ConclusionDetector`） | bugfix | 代码意图清晰，要么用上动态检测要么减少死代码 |
+| **P1** | 加 query 20 早期检查点 | feature | 覆盖 42% qpf<37 case |
+| **P1** | 新增 B6: Empty-Service Hypothesis 维度 | feature | 解决 M3-recurring 反模式 |
+| **P2** | B1 检测器排除 baseline 类意图，避免与 B3 自循环 | bugfix | 解决 case 1495 类自循环 |
+| **P2** | 升级 R5/R6 高反复案例的强干预（"列出反例假设" 类） | feature | 突破 R6 锚定回退的厚墙 |
+| **P3** | 区分 L1 扰动效应 vs MW 真实救回（实验设计层面） | analysis | 真实 MW 增益统计可信 |
+
+---
+
 ## 关键文件
 
 | 文件 | 作用 |
@@ -217,3 +407,4 @@ L3 生成干预文本时的硬规则：
 | v1 | 2026-04-09 | 初版：D1-D5 维度，固定间隔 check_interval=5 |
 | v2 | 2026-04-10 | D×R 对齐重构：B1/B2/B3/B5/M1-M4，双时机检测，维度去重 |
 | v3 | 2026-04-11 | 检查点优化：固定间隔 → 数据驱动检查点 [37,44]，max_interventions 5→3 |
+| v3-doc | 2026-04-14 | 105 case 实跑分析；记录 3 个 v3 已知 bug；发布 v4 路线图 |
